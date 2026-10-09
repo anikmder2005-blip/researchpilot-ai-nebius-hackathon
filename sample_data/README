@@ -1,0 +1,6 @@
+# Sample data
+
+`rag_vs_finetuning_notes.md` is a short, original note file written for demos. Upload it on the
+**Documents** page, then ask: *"According to my notes, when should a student project prefer RAG over fine-tuning?"*
+
+It is demo input only - not a benchmark or a verified source.
