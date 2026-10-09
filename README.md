@@ -1,6 +1,6 @@
 # ResearchPilot AI
 
-> **From scattered information to evidence-backed intelligence.**
+> **From scattered information to evidence-backed intelligence.** 
 
 ResearchPilot AI is a research agent for students, developers and researchers. Give it a question (and optionally
 your own PDF / TXT / Markdown documents) and it plans the research, searches the web, retrieves passages from your
