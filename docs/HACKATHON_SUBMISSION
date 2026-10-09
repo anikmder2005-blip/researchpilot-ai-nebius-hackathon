@@ -1,0 +1,49 @@
+# Hackathon Submission Draft - ResearchPilot AI
+
+**Project name:** ResearchPilot AI
+**Track:** Best Apps and Agents
+**Tagline:** From scattered information to evidence-backed intelligence.
+
+## Elevator pitch
+ResearchPilot AI is a research agent that doesn't just answer - it shows its evidence. It plans a research strategy,
+searches the live web and your own PDFs, and produces a cited report in which every claim points to a real source,
+and gaps are called out instead of papered over.
+
+## Problem
+Chatbot answers to research questions are fluent but unverifiable. Students and developers waste time checking
+claims, and fabricated citations are a real risk.
+
+## Target users
+University students, developers evaluating technologies, AI/ML learners, and researchers synthesising sources.
+
+## Solution and unique value
+- Separates **evidence** (tool outputs) from **interpretation** (model text).
+- Citation IDs are assigned by code; invented citations are detected and removed.
+- Bounded agent (tool-call, round and time limits) with a real activity timeline.
+- Works on web sources, uploaded documents, or both; says "no evidence" rather than guessing.
+- Project memory the user fully controls, and a downloadable Markdown report with a methodology section that reflects what actually ran.
+
+## Key features
+Research planning · Tavily web search · PDF/TXT/MD RAG with page attribution · SQLite project memory ·
+Markdown report export · explainable activity timeline · prompt-injection-aware evidence handling.
+
+## Technology stack
+Python, Streamlit, FAISS, PyMuPDF, SQLite, `requests`, pytest/unittest.
+
+## NVIDIA model
+Default: **`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`** (configurable via `NEBIUS_MODEL`).
+*Before submitting, run `python scripts/verify_setup.py --live` and put the exact model ID that your account confirms here.*
+
+## How Nebius is used
+- **Nebius Token Factory** for all Nemotron chat inference (planning, sufficiency check, answer) and for embeddings.
+- Deployment path: Docker container on a **Nebius AI Cloud** VM (instructions in README; not yet deployed or tested by the author).
+
+## Impact
+Helps people produce research they can defend: every claim traceable, uncertainty visible.
+
+## Roadmap
+Evaluation harness on labelled questions, reranking, OCR, persistent vector store, PDF export, authentication, streaming.
+
+## Not claimed
+No team members, user counts, benchmarks, evaluation scores or completed deployments are claimed in this draft.
+Add team details and any measured results yourself, only if real.
