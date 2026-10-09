@@ -1,0 +1,83 @@
+import json
+import os
+import tempfile
+import unittest
+
+from memory.database import connect
+from memory.repository import MemoryRepository
+
+SOURCES = [{"id": "W1", "kind": "web", "title": "T", "url": "https://x.org", "source_name": "x.org",
+            "published": "", "location": "", "text": "FULL PAGE TEXT SHOULD NOT BE STORED"}]
+
+
+class MemoryTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = MemoryRepository(connect(":memory:"))
+
+    def test_project_lifecycle(self):
+        pid = self.repo.create_project("  RAG study  ")
+        self.assertEqual(self.repo.get_project(pid)["title"], "RAG study")
+        self.repo.rename_project(pid, "RAG vs FT")
+        self.assertEqual(self.repo.list_projects()[0]["title"], "RAG vs FT")
+        with self.assertRaises(ValueError):
+            self.repo.create_project("   ")
+
+    def test_history_and_findings_store_only_references(self):
+        pid = self.repo.create_project("p")
+        self.repo.add_question(pid, "Q?", "summary", "answer", SOURCES)
+        self.repo.add_finding(pid, "RAG is cheaper", SOURCES)
+        q = self.repo.list_questions(pid)[0]
+        self.assertEqual((q["question"], q["summary"]), ("Q?", "summary"))
+        self.assertEqual(q["sources"][0]["url"], "https://x.org")
+        self.assertNotIn("text", q["sources"][0])
+        self.assertNotIn("FULL PAGE TEXT", json.dumps(self.repo.export_all()))
+        with self.assertRaises(ValueError):
+            self.repo.add_finding(pid, "  ", [])
+
+    def test_preferences_upsert_and_delete(self):
+        pid = self.repo.create_project("p")
+        self.repo.set_preference(pid, "tone", "concise")
+        self.repo.set_preference(pid, "tone", "detailed")
+        self.assertEqual(self.repo.get_preferences(pid), {"tone": "detailed"})
+        self.repo.delete_preference(pid, "tone")
+        self.assertEqual(self.repo.get_preferences(pid), {})
+
+    def test_delete_project_cascades(self):
+        pid = self.repo.create_project("p")
+        self.repo.set_preference(pid, "k", "v")
+        self.repo.add_question(pid, "Q", "s", "a", [])
+        self.repo.add_finding(pid, "f", [])
+        self.repo.delete_project(pid)
+        self.assertEqual(self.repo.counts(), {"projects": 0, "preferences": 0, "questions": 0, "findings": 0})
+
+    def test_delete_single_items_and_clear_all(self):
+        pid = self.repo.create_project("p")
+        qid = self.repo.add_question(pid, "Q", "s", "a", [])
+        fid = self.repo.add_finding(pid, "f", [])
+        self.repo.delete_question(qid)
+        self.repo.delete_finding(fid)
+        self.assertEqual(self.repo.list_questions(pid) + self.repo.list_findings(pid), [])
+        self.repo.add_finding(pid, "again", [])
+        self.repo.clear_all()
+        self.assertEqual(sum(self.repo.counts().values()), 0)
+
+    def test_persists_across_connections(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "sub", "mem.db")
+            r1 = MemoryRepository(connect(path))
+            pid = r1.create_project("persisted")
+            r1.add_finding(pid, "kept", [])
+            r1.conn.close()
+            r2 = MemoryRepository(connect(path))
+            self.assertEqual(r2.list_projects()[0]["title"], "persisted")
+            self.assertEqual(r2.list_findings(pid)[0]["text"], "kept")
+            r2.conn.close()
+
+    def test_sql_injection_text_is_stored_literally(self):
+        pid = self.repo.create_project("x'); DROP TABLE projects;--")
+        self.assertEqual(self.repo.get_project(pid)["title"], "x'); DROP TABLE projects;--")
+        self.assertEqual(self.repo.counts()["projects"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
