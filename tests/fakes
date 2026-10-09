@@ -1,0 +1,172 @@
+"""Test doubles. No network, no credentials."""
+from __future__ import annotations
+
+import json
+import re
+import zlib
+
+import numpy as np
+import requests
+
+from config.settings import Settings, load_settings
+from core.llm import LLMError, extract_json
+from rag.embeddings import l2_normalize
+from tools.web_search import SearchError, SearchHit, SearchProvider
+
+
+def make_settings(**overrides) -> Settings:
+    env = {"NEBIUS_API_KEY": "test-key-123456", "TAVILY_API_KEY": "tvly-test-123456"}
+    s = load_settings(env=env, load_env_file=False)
+    from dataclasses import replace
+
+    return replace(s, **overrides) if overrides else s
+
+
+class FakeResponse:
+    def __init__(self, status=200, payload=None, text=""):
+        self.status_code = status
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+class FakeSession:
+    """Returns queued responses/exceptions in order; records requests."""
+
+    def __init__(self, *queue):
+        self.queue = list(queue)
+        self.requests = []
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.requests.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        item = self.queue.pop(0) if len(self.queue) > 1 else self.queue[0]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def chat_ok(content, finish="stop"):
+    return FakeResponse(200, {"choices": [{"message": {"content": content}, "finish_reason": finish}]})
+
+
+class FakeLLM:
+    """Scripted stand-in for LLMClient used by agent tests."""
+
+    model = "nvidia/fake-nemotron"
+
+    def __init__(self, plan=None, reflect=None, answer=None, fail_synth=False, fail_plan=False):
+        self.plan = plan if plan is not None else {
+            "subquestions": ["What is RAG?", "What is fine-tuning?"],
+            "use_web": True, "use_docs": False, "rationale": "Compare two approaches.",
+        }
+        self.reflect = reflect if reflect is not None else {"sufficient": True, "follow_up_queries": []}
+        self.answer = answer if answer is not None else (
+            "## Executive Summary\nRAG is cheaper to start [W1].\n"
+            "## Key Findings\n- Fine-tuning needs data [W2].\n"
+            "## Comparison\nNot applicable.\n"
+            "## Conflicts and Uncertainty\nNone found.\n"
+            "## Limitations\nSmall sample.\n"
+            "## Conclusion\nStart with RAG [W1]."
+        )
+        self.fail_synth = fail_synth
+        self.fail_plan = fail_plan
+        self.calls = []
+
+    def _kind(self, messages):
+        sys_msg = messages[0]["content"]
+        if "research planner" in sys_msg:
+            return "plan"
+        if "review research evidence" in sys_msg:
+            return "reflect"
+        return "synth"
+
+    def chat(self, messages, max_tokens=None, temperature=0.2):
+        kind = self._kind(messages)
+        self.calls.append((kind, messages))
+        if kind == "synth":
+            if self.fail_synth:
+                raise LLMError("Model request failed: HTTP 503")
+            return self.answer
+        raise AssertionError("chat() called for json kind")
+
+    def chat_json(self, messages, max_tokens=None):
+        kind = self._kind(messages)
+        self.calls.append((kind, messages))
+        if kind == "plan":
+            if self.fail_plan:
+                raise LLMError("planner down")
+            return self.plan
+        return self.reflect
+
+
+class FakeSearch(SearchProvider):
+    name = "FakeSearch"
+
+    def __init__(self, hits_by_query=None, error=None):
+        self.hits_by_query = hits_by_query or {}
+        self.error = error
+        self.queries = []
+
+    def search(self, query, max_results=5):
+        self.queries.append(query)
+        if self.error:
+            raise self.error
+        if query in self.hits_by_query:
+            return self.hits_by_query[query]
+        n = len(self.queries)
+        return [SearchHit(title=f"Result {n}", url=f"https://example.org/{n}", content=f"Content about {query}",
+                          source_name="example.org", published="2026-01-01")]
+
+
+class HashEmbedder:
+    """Deterministic bag-of-words embedder so retrieval logic is tested for real."""
+
+    def __init__(self, dim=256, fail=None):
+        self.dim = dim
+        self.fail = fail
+        self.calls = 0
+
+    def embed(self, texts):
+        if self.fail:
+            raise self.fail
+        self.calls += 1
+        mat = np.zeros((len(texts), self.dim), dtype="float32")
+        for i, t in enumerate(texts):
+            for tok in re.findall(r"[a-z0-9]+", t.lower()):
+                mat[i, zlib.crc32(tok.encode()) % self.dim] += 1.0
+        return l2_normalize(mat)
+
+
+def make_pdf(pages: list[str]) -> bytes:
+    """Build a minimal valid text PDF (Helvetica) without external libraries."""
+    objs: list[bytes] = []
+    n = len(pages)
+    kids = " ".join(f"{3 + i * 2} 0 R" for i in range(n))
+    objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    objs.append(f"<< /Type /Pages /Kids [{kids}] /Count {n} >>".encode())
+    font_id = 3 + n * 2
+    for i, text in enumerate(pages):
+        content_id = 4 + i * 2
+        objs.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {content_id} 0 R "
+            f"/Resources << /Font << /F1 {font_id} 0 R >> >> >>".encode()
+        )
+        esc = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        stream = f"BT /F1 12 Tf 72 720 Td ({esc}) Tj ET".encode()
+        objs.append(b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream")
+    objs.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objs, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    return bytes(out)
