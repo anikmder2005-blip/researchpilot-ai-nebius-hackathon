@@ -1,0 +1,83 @@
+# Technical Report - ResearchPilot AI
+
+## 1. Problem
+Students and developers researching a topic juggle search results, papers and their own documents, then ask
+chatbots that answer fluently without showing evidence. Fabricated sources and unmarked uncertainty make such
+answers risky to reuse. ResearchPilot makes the evidence trail the product.
+
+## 2. Architecture
+See [ARCHITECTURE.md](ARCHITECTURE.md). A Streamlit UI drives a `ResearchAgent` that uses a Nemotron model (via
+Nebius Token Factory), a search provider (Tavily), and a document retriever (FAISS + Nebius embeddings). Results
+feed SQLite memory and a Markdown report generator.
+
+## 3. Why Nemotron
+The hackathon asks for an NVIDIA open model. Nemotron models are positioned for reasoning and agentic workloads,
+which suits planning, sufficiency checks and grounded synthesis. The default configured ID is
+`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B` (small, inexpensive, listed in public catalog data for Token Factory). Larger
+Nemotron IDs can be selected via `NEBIUS_MODEL`. Nothing in this report claims measured quality or benchmark results.
+
+## 4. Nebius Token Factory integration
+- Endpoint: `https://api.tokenfactory.nebius.com/v1/` (OpenAI-compatible; documented by Nebius and partner docs).
+- Auth: `Authorization: Bearer <NEBIUS_API_KEY>`.
+- Calls: `POST /chat/completions` (chat) and `POST /embeddings` (RAG) through `requests`; `GET /models` in
+  `scripts/verify_setup.py` to confirm the configured model is available to the account.
+- Reasoning models may return empty `content` if `max_tokens` is consumed by reasoning; this is detected and reported.
+- An NVIDIA NIM endpoint can be selected explicitly with `LLM_PROVIDER=nvidia_nim`. There is **no silent fallback**
+  between providers.
+
+## 5. Agent orchestration
+A custom loop (no framework) keeps behaviour explicit and testable:
+1. **Plan** - JSON plan of ≤4 sub-questions; unusable output → labelled fallback plan.
+2. **Gather** - per sub-question, document retrieval and/or web search. Hard caps: `AGENT_MAX_STEPS` tool calls,
+   `AGENT_MAX_ROUNDS` rounds, `AGENT_DEADLINE_S` seconds (checked before every tool call).
+3. **Reflect** - model reports whether evidence suffices and proposes ≤2 follow-up queries (round 2 only).
+4. **Synthesise** - structured Markdown with citations, then citation validation.
+Stop reasons are recorded and shown.
+
+## 6. RAG pipeline
+Validate (extension, size, PDF signature, binary check) → extract (PyMuPDF, pypdf fallback; per-page) → clean →
+chunk (≈1000 chars, 150 overlap, word-boundary aware, one page per chunk) → embed (Nebius) → L2-normalise → FAISS
+`IndexFlatIP` (cosine). Retrieval returns top-k above `DOC_MIN_SCORE`; an empty result means "insufficient evidence"
+and nothing is invented. FAISS vs ChromaDB: FAISS is lighter and exact at this scale but has no persistence or metadata
+filter; ChromaDB would add both with a heavier dependency. A NumPy backend is used if FAISS is not installed.
+
+## 7. Web search and citations
+Tavily results are parsed into `SearchHit`s; entries without a real http(s) URL or content are dropped. Search
+snippets are stored as evidence, separate from the model's answer. Citations use evidence IDs; the report maps IDs to
+real URLs/filenames/pages and marks sources that were consulted but not cited.
+
+## 8. Memory
+SQLite tables: projects, preferences, questions (question, summary, answer, source *references*), findings. No API
+keys and no document bodies or full page text are stored. The UI can inspect raw data, delete items/projects and clear all.
+Only user-saved preferences and findings are fed back to the model as context.
+
+## 9. Security considerations
+- Secrets only from environment; redacted from errors/logs; `.env` ignored by git and excluded from the archive.
+- Upload validation, size limits, sanitised filenames; files never executed or written to disk.
+- Prompt injection: retrieved text fenced as data; model told to ignore embedded instructions; tool availability and
+  citation IDs are decided by code. This reduces but cannot eliminate the risk.
+- Markdown images are stripped from model output (avoids remote tracking fetches); Streamlit does not render raw HTML
+  from content; the few `unsafe_allow_html` uses render only escaped, app-generated strings.
+- SQL uses parameter binding. No authentication - do not expose the app publicly as-is.
+
+## 10. Testing
+`unittest`-style tests (run by pytest or the standard library) with mocked HTTP sessions and a deterministic hash
+embedder: configuration, planner, agent step/round/deadline limits, error handling, citation validation, injection
+fencing, search parsing, chunking, ingestion (including a generated PDF), retrieval and attribution, memory CRUD, and report
+structure. A separate opt-in live test exercises real Nebius chat and embeddings.
+
+## 11. Verification status (honest)
+| Item | Status |
+|---|---|
+| Unit tests | Run by the package author's environment - see the final test log in the delivery message |
+| Streamlit UI rendering | **Not run** (Streamlit could not be installed in the build environment). App code paths were executed against a stubbed `streamlit` only |
+| Live Nebius chat / embeddings / model IDs | **Not verified** (no API key available); use `scripts/verify_setup.py --live` |
+| Live Tavily search | **Not verified** |
+| FAISS backend | **Not run** (not installable in the build environment); NumPy fallback tested |
+| PyMuPDF path | **Not run**; pypdf path tested |
+| Official hackathon rules | **Not read**; only a third-party summary was available |
+| Docker image | **Not built** |
+
+## 12. Limitations and future work
+No OCR; per-session document index; heuristic relevance threshold; no reranking; evaluation on a labelled question set
+is future work; PDF export; authentication and multi-user storage; streaming answers; persistent vector store.
