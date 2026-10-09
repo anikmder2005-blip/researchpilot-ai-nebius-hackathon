@@ -1,0 +1,232 @@
+import unittest
+
+import numpy as np
+import requests
+
+from rag.chunking import chunk_pages, clean_text, split_text
+from rag.embeddings import EmbeddingError, NebiusEmbedder
+from rag.ingestion import IngestionError, extract_pages, safe_filename, validate_upload
+from rag.retrieval import DocumentStore
+from tests.fakes import FakeResponse, FakeSession, HashEmbedder, make_pdf, make_settings
+from tools.document_search import DocumentSearchTool
+from tools.web_search import SearchError, TavilyProvider, parse_tavily_response
+
+
+class ChunkingTests(unittest.TestCase):
+    def test_clean_text(self):
+        self.assertEqual(clean_text("retriev-\nal   works\x00 ok\r\n\r\n\r\n\r\nend"), "retrieval works ok\n\nend")
+
+    def test_split_respects_size_and_overlap(self):
+        text = " ".join(f"word{i}" for i in range(400))
+        parts = split_text(text, size=200, overlap=40)
+        self.assertGreater(len(parts), 5)
+        self.assertTrue(all(len(p) <= 200 for p in parts))
+        # overlap: consecutive chunks share some words
+        self.assertTrue(set(parts[0].split()) & set(parts[1].split()))
+        # no content lost: every word appears in at least one chunk
+        self.assertEqual({w for p in parts for w in p.split()}, set(text.split()))
+
+    def test_short_and_empty(self):
+        self.assertEqual(split_text("short", 100, 10), ["short"])
+        self.assertEqual(split_text("   ", 100, 10), [])
+
+    def test_chunks_keep_page_attribution(self):
+        chunks = chunk_pages([(1, "alpha " * 100), (2, "beta " * 100)], "f.pdf", size=200, overlap=20)
+        self.assertTrue({c.page for c in chunks} == {1, 2})
+        self.assertTrue(all(c.filename == "f.pdf" for c in chunks))
+        self.assertEqual(chunks[0].location, "page 1")
+        self.assertEqual([c.index for c in chunks], list(range(len(chunks))))
+
+
+class IngestionTests(unittest.TestCase):
+    def test_unsupported_type_empty_and_too_large(self):
+        with self.assertRaises(IngestionError) as cm:
+            validate_upload("evil.exe", b"MZ", 10)
+        self.assertIn("Unsupported", str(cm.exception))
+        with self.assertRaises(IngestionError):
+            validate_upload("a.txt", b"", 10)
+        with self.assertRaises(IngestionError) as cm:
+            validate_upload("big.txt", b"x" * (2 * 1024 * 1024), 1)
+        self.assertIn("1 MB", str(cm.exception))
+
+    def test_fake_pdf_and_binary_text_rejected(self):
+        with self.assertRaises(IngestionError):
+            validate_upload("a.pdf", b"not a pdf", 10)
+        with self.assertRaises(IngestionError):
+            validate_upload("a.txt", b"abc\x00def", 10)
+
+    def test_filename_sanitised(self):
+        self.assertEqual(safe_filename("../../etc/passwd.txt"), "passwd.txt")
+        self.assertEqual(safe_filename("C:\\x\\my file<>.md"), "my file__.md")
+
+    def test_text_and_markdown(self):
+        name, pages = extract_pages("notes.md", b"# Title\nHello world", 10)
+        self.assertEqual((name, pages), ("notes.md", [(None, "# Title\nHello world")]))
+
+    def test_whitespace_only_rejected(self):
+        with self.assertRaises(IngestionError) as cm:
+            extract_pages("blank.txt", b"   \n  ", 10)
+        self.assertIn("No extractable text", str(cm.exception))
+
+    def test_pdf_pages_extracted(self):
+        try:
+            import pypdf  # noqa: F401
+        except ImportError:
+            try:
+                import fitz  # noqa: F401
+            except ImportError:
+                self.skipTest("no PDF library installed")
+        data = make_pdf(["First page about retrieval", "Second page about fine tuning"])
+        name, pages = extract_pages("paper.pdf", data, 10)
+        self.assertEqual([p for p, _ in pages], [1, 2])
+        self.assertIn("retrieval", pages[0][1])
+        self.assertIn("fine tuning", pages[1][1])
+
+    def test_corrupted_pdf_has_clear_error(self):
+        with self.assertRaises(IngestionError) as cm:
+            extract_pages("bad.pdf", b"%PDF-1.4\ngarbage that is not a pdf", 10)
+        self.assertIn("bad.pdf", str(cm.exception))
+
+    def test_empty_pdf_has_no_text(self):
+        try:
+            import pypdf
+        except ImportError:
+            self.skipTest("pypdf not installed")
+        import io
+        w = pypdf.PdfWriter()
+        w.add_blank_page(width=200, height=200)
+        buf = io.BytesIO()
+        w.write(buf)
+        with self.assertRaises(IngestionError) as cm:
+            extract_pages("blank.pdf", buf.getvalue(), 10)
+        self.assertIn("No extractable text", str(cm.exception))
+
+
+class RetrievalTests(unittest.TestCase):
+    def store(self, use_faiss=False):
+        s = DocumentStore(HashEmbedder(), chunk_size=300, chunk_overlap=30, use_faiss=use_faiss)
+        s.add_document("rag.pdf", [(1, "Retrieval augmented generation combines a retriever with a language model to ground answers."),
+                                   (2, "Vector databases store embeddings for similarity search.")])
+        s.add_document("ft.txt", [(None, "Fine tuning updates model weights using labelled training data and GPUs.")])
+        return s
+
+    def test_retrieves_right_document_with_attribution(self):
+        s = self.store()
+        hits = s.search("how does fine tuning update model weights", k=2, min_score=0.2)
+        self.assertEqual(hits[0].chunk.filename, "ft.txt")
+        hits = s.search("vector databases similarity search embeddings", k=2, min_score=0.2)
+        self.assertEqual((hits[0].chunk.filename, hits[0].chunk.page), ("rag.pdf", 2))
+
+    def test_insufficient_evidence_returns_nothing(self):
+        self.assertEqual(self.store().search("quantum chromodynamics lattice gauge", k=3, min_score=0.3), [])
+
+    def test_documents_listing_remove_and_replace(self):
+        s = self.store()
+        self.assertEqual(set(s.documents), {"rag.pdf", "ft.txt"})
+        s.remove_document("rag.pdf")
+        self.assertEqual(set(s.documents), {"ft.txt"})
+        self.assertEqual(s.search("vector databases similarity", k=2, min_score=0.3), [])
+        s.add_document("ft.txt", [(None, "Replacement text about adapters")])  # same name replaces
+        self.assertEqual(s.documents, {"ft.txt": 1})
+        s.clear()
+        self.assertEqual(len(s), 0)
+        self.assertEqual(s.search("anything", 3, 0.0), [])
+
+    def test_faiss_backend_matches_numpy_when_available(self):
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+        a, b = self.store(use_faiss=True), self.store(use_faiss=False)
+        self.assertEqual(a.backend, "faiss")
+        q = "fine tuning model weights"
+        self.assertEqual([h.chunk.text for h in a.search(q, 3, 0.0)], [h.chunk.text for h in b.search(q, 3, 0.0)])
+
+    def test_embedding_failure_propagates_without_corrupting_store(self):
+        s = DocumentStore(HashEmbedder(fail=EmbeddingError("down")), use_faiss=False)
+        with self.assertRaises(EmbeddingError):
+            s.add_document("a.txt", [(None, "hello world")])
+        self.assertEqual(len(s), 0)
+
+    def test_document_tool_builds_evidence(self):
+        tool = DocumentSearchTool(self.store(), top_k=2, min_score=0.2)
+        self.assertTrue(tool.available)
+        ev = tool.run("retrieval augmented generation language model")
+        self.assertEqual(ev[0].kind, "doc")
+        self.assertEqual(ev[0].location, "page 1")
+        self.assertEqual(ev[0].source_name, "rag.pdf")
+
+
+class EmbedderTests(unittest.TestCase):
+    def ok(self, vecs):
+        return FakeResponse(200, {"data": [{"index": i, "embedding": v} for i, v in enumerate(vecs)]})
+
+    def test_embeds_and_normalises(self):
+        sess = FakeSession(self.ok([[3.0, 4.0], [0.0, 2.0]]))
+        out = NebiusEmbedder(make_settings(), session=sess).embed(["a", "b"])
+        np.testing.assert_allclose(np.linalg.norm(out, axis=1), [1.0, 1.0], rtol=1e-5)
+        self.assertTrue(sess.requests[0]["url"].endswith("/embeddings"))
+
+    def test_batches_large_inputs(self):
+        sess = FakeSession(self.ok([[1.0, 0.0]] * 32), self.ok([[1.0, 0.0]] * 3))
+        out = NebiusEmbedder(make_settings(), session=sess).embed(["t"] * 35)
+        self.assertEqual(out.shape, (35, 2))
+        self.assertEqual(len(sess.requests), 2)
+
+    def test_errors(self):
+        for resp, text in [(FakeResponse(401, {}), "401"), (FakeResponse(200, {"x": 1}), "malformed"),
+                           (self.ok([[1.0]]), "wrong number")]:
+            with self.assertRaises(EmbeddingError) as cm:
+                NebiusEmbedder(make_settings(), session=FakeSession(resp)).embed(["a", "b"])
+            self.assertIn(text, str(cm.exception))
+        with self.assertRaises(EmbeddingError):
+            NebiusEmbedder(make_settings(), session=FakeSession(requests.Timeout())).embed(["a"])
+
+
+class SearchTests(unittest.TestCase):
+    PAYLOAD = {"results": [
+        {"title": "Good", "url": "https://www.example.com/a", "content": "Useful text", "score": 0.9, "published_date": "2026-03-01"},
+        {"title": "No url", "url": "", "content": "x"},
+        {"title": "Javascript", "url": "javascript:alert(1)", "content": "x"},
+        {"title": "No content", "url": "https://b.org", "content": ""},
+        "garbage",
+        {"url": "https://c.org/p", "content": "Untitled", "score": "bad"},
+    ]}
+
+    def test_parse_keeps_only_real_sources(self):
+        hits = parse_tavily_response(self.PAYLOAD)
+        self.assertEqual([h.url for h in hits], ["https://www.example.com/a", "https://c.org/p"])
+        self.assertEqual(hits[0].source_name, "example.com")
+        self.assertEqual(hits[0].published, "2026-03-01")
+        self.assertEqual(hits[1].title, "c.org")
+        self.assertEqual(hits[1].score, 0.0)
+
+    def test_bad_shape(self):
+        with self.assertRaises(SearchError):
+            parse_tavily_response({"results": "nope"})
+        with self.assertRaises(SearchError):
+            parse_tavily_response([])
+
+    def test_provider_success_and_request(self):
+        sess = FakeSession(FakeResponse(200, self.PAYLOAD))
+        hits = TavilyProvider("tvly-key-123456", session=sess).search("rag vs fine-tuning", 3)
+        self.assertEqual(len(hits), 2)
+        req = sess.requests[0]
+        self.assertEqual(req["json"]["max_results"], 3)
+        self.assertEqual(req["headers"]["Authorization"], "Bearer tvly-key-123456")
+
+    def test_provider_errors(self):
+        cases = [(FakeResponse(429, {}), "rate limit"), (FakeResponse(401, {}), "API key"),
+                 (FakeResponse(500, {}), "HTTP 500"), (FakeResponse(200, None), "invalid JSON"),
+                 (requests.Timeout(), "timed out"), (requests.ConnectionError("boom tvly-key-123456"), "network")]
+        for item, text in cases:
+            with self.assertRaises(SearchError) as cm:
+                TavilyProvider("tvly-key-123456", session=FakeSession(item)).search("q")
+            self.assertIn(text, str(cm.exception))
+            self.assertNotIn("tvly-key-123456", str(cm.exception))
+        with self.assertRaises(SearchError):
+            TavilyProvider("").search("q")
+
+
+if __name__ == "__main__":
+    unittest.main()
