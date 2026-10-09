@@ -1,0 +1,22 @@
+"""Minimal, theme-aware CSS. Uses Streamlit theme variables so contrast holds in light and dark mode."""
+
+CSS = """
+<style>
+.block-container { padding-top: 2rem; padding-bottom: 4rem; max-width: 1100px; }
+.rp-brand { font-size: 1.35rem; font-weight: 700; letter-spacing: -0.01em; margin-bottom: 0; }
+.rp-tag { font-size: 0.85rem; opacity: 0.75; margin-top: 0; margin-bottom: 1rem; }
+.rp-chip { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.78rem;
+           border: 1px solid rgba(128,128,128,0.45); margin-right: 6px; }
+.rp-ok { border-color: #2e9e5b; color: #2e9e5b; }
+.rp-warn { border-color: #b7791f; color: #b7791f; }
+.rp-err { border-color: #d64545; color: #d64545; }
+.rp-card { border: 1px solid rgba(128,128,128,0.35); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 0.6rem; }
+.rp-card h4 { margin: 0 0 0.25rem 0; font-size: 0.95rem; }
+.rp-meta { font-size: 0.8rem; opacity: 0.75; }
+.rp-step { display: flex; gap: 10px; padding: 4px 0; font-size: 0.9rem; }
+.rp-step .rp-dot { width: 10px; height: 10px; border-radius: 50%; margin-top: 6px; flex: none; }
+.rp-dot-ok { background: #2e9e5b; } .rp-dot-warning { background: #b7791f; }
+.rp-dot-error { background: #d64545; } .rp-dot-skipped { background: #888; }
+@media (max-width: 640px) { .block-container { padding-left: 1rem; padding-right: 1rem; } }
+</style>
+"""
