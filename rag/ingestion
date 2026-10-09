@@ -1,0 +1,91 @@
+"""Upload validation and text extraction for PDF / TXT / Markdown.
+
+Uploaded content is untrusted data: it is only ever parsed as text, never executed.
+"""
+from __future__ import annotations
+
+import io
+import os
+import re
+
+from config.settings import ALLOWED_UPLOAD_EXTENSIONS
+
+
+class IngestionError(ValueError):
+    """Raised for invalid or unreadable uploads. Message is safe to show to the user."""
+
+
+def safe_filename(name: str) -> str:
+    """Strip any path components and odd characters from a user-supplied filename."""
+    base = os.path.basename((name or "").replace("\\", "/"))
+    base = re.sub(r"[^\w.\- ()]", "_", base).strip(" .")
+    return base[:120] or "document"
+
+
+def validate_upload(filename: str, data: bytes, max_mb: int) -> str:
+    """Validate type, size, and content signature. Returns the sanitised filename."""
+    name = safe_filename(filename)
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise IngestionError(
+            f"Unsupported file type '{ext or 'unknown'}'. Allowed: PDF, TXT, Markdown."
+        )
+    if not data:
+        raise IngestionError(f"'{name}' is empty.")
+    if len(data) > max_mb * 1024 * 1024:
+        raise IngestionError(f"'{name}' is larger than the {max_mb} MB limit.")
+    if ext == ".pdf" and not data.lstrip()[:5] == b"%PDF-":
+        raise IngestionError(f"'{name}' does not look like a valid PDF file.")
+    if ext != ".pdf" and b"\x00" in data[:4096]:
+        raise IngestionError(f"'{name}' looks like a binary file, not text.")
+    return name
+
+
+def _extract_pdf(data: bytes, name: str) -> list[tuple[int | None, str]]:
+    pages: list[tuple[int | None, str]] = []
+    try:
+        import fitz  # PyMuPDF (preferred)
+
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            if doc.needs_pass:
+                raise IngestionError(f"'{name}' is password protected.")
+            for i, page in enumerate(doc, start=1):
+                pages.append((i, page.get_text("text")))
+    except ImportError:
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            raise IngestionError("No PDF library installed. Run: pip install pymupdf")
+        try:
+            reader = PdfReader(io.BytesIO(data))
+            if reader.is_encrypted:
+                raise IngestionError(f"'{name}' is password protected.")
+            for i, page in enumerate(reader.pages, start=1):
+                pages.append((i, page.extract_text() or ""))
+        except IngestionError:
+            raise
+        except Exception:
+            raise IngestionError(f"Could not read '{name}' as a PDF (it may be corrupted).")
+    except IngestionError:
+        raise
+    except Exception:
+        raise IngestionError(f"Could not read '{name}' as a PDF (it may be corrupted).")
+    return pages
+
+
+def extract_pages(filename: str, data: bytes, max_mb: int = 10) -> tuple[str, list[tuple[int | None, str]]]:
+    """Validate and extract text. Returns (clean_filename, [(page_or_None, text), ...])."""
+    name = validate_upload(filename, data, max_mb)
+    if name.lower().endswith(".pdf"):
+        pages = _extract_pdf(data, name)
+    else:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = data.decode("latin-1", errors="replace")
+        pages = [(None, text)]
+    if not any(t.strip() for _, t in pages):
+        raise IngestionError(
+            f"No extractable text found in '{name}'. Scanned PDFs need OCR, which is not supported."
+        )
+    return name, pages
