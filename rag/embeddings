@@ -1,0 +1,74 @@
+"""Embeddings via an OpenAI-compatible /embeddings endpoint (Nebius Token Factory by default).
+
+The chat model cannot embed, so embeddings use a separate, configurable model.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Optional, Protocol
+
+import numpy as np
+import requests
+
+from config.settings import Settings, redact
+
+log = logging.getLogger("researchpilot.embeddings")
+BATCH = 32
+
+
+class EmbeddingError(RuntimeError):
+    """Embedding request failed. Message is user-safe."""
+
+
+class Embedder(Protocol):
+    def embed(self, texts: list[str]) -> np.ndarray: ...
+
+
+def l2_normalize(mat: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return (mat / norms).astype("float32")
+
+
+class NebiusEmbedder:
+    def __init__(self, settings: Settings, session: Optional[requests.Session] = None):
+        self.settings = settings
+        self.session = session or requests.Session()
+
+    def embed(self, texts: list[str]) -> np.ndarray:
+        s = self.settings
+        if not s.embeddings_ready:
+            raise EmbeddingError("Embeddings are not configured (set NEBIUS_API_KEY or EMBEDDING_API_KEY).")
+        if not texts:
+            return np.zeros((0, 0), dtype="float32")
+        vectors: list[list[float]] = []
+        for i in range(0, len(texts), BATCH):
+            vectors.extend(self._embed_batch(texts[i : i + BATCH]))
+        return l2_normalize(np.asarray(vectors, dtype="float32"))
+
+    def _embed_batch(self, batch: list[str]) -> list[list[float]]:
+        s = self.settings
+        url = s.embedding_base_url + "embeddings"
+        headers = {"Authorization": f"Bearer {s.embedding_api_key}", "Content-Type": "application/json"}
+        try:
+            resp = self.session.post(
+                url, headers=headers, json={"model": s.embedding_model, "input": batch}, timeout=s.request_timeout_s
+            )
+        except requests.Timeout:
+            raise EmbeddingError("Embedding request timed out.")
+        except requests.RequestException as exc:
+            raise EmbeddingError(f"Embedding network error: {redact(str(exc), s.embedding_api_key)}")
+        if resp.status_code != 200:
+            hint = {401: "check your API key", 404: "check EMBEDDING_MODEL", 429: "rate limited"}.get(
+                resp.status_code, "request failed"
+            )
+            raise EmbeddingError(f"Embedding request failed (HTTP {resp.status_code}: {hint}).")
+        try:
+            data = resp.json()["data"]
+            ordered = sorted(data, key=lambda d: d.get("index", 0))
+            out = [d["embedding"] for d in ordered]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise EmbeddingError("Embedding service returned a malformed response.")
+        if len(out) != len(batch):
+            raise EmbeddingError("Embedding service returned the wrong number of vectors.")
+        return out
