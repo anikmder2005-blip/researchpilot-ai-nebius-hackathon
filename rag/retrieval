@@ -1,0 +1,148 @@
+"""In-memory vector index over uploaded documents.
+
+Vector store choice: FAISS (IndexFlatIP on L2-normalised vectors == cosine similarity).
+Trade-offs vs ChromaDB: FAISS is a tiny dependency with exact search, ideal for a per-session
+index of a few thousand chunks, but it has no built-in persistence or metadata filtering
+(we keep metadata in a Python list). ChromaDB adds persistence/metadata at the cost of a
+heavier dependency. If `faiss` is not installed we fall back to an exact NumPy dot product,
+which gives identical results at this scale.
+
+The index lives only in memory for the session: uploaded document text is not written to disk.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+
+import numpy as np
+
+from rag.chunking import Chunk, chunk_pages
+from rag.embeddings import Embedder
+
+log = logging.getLogger("researchpilot.retrieval")
+
+try:  # optional dependency
+    import faiss  # type: ignore
+except Exception:  # pragma: no cover
+    faiss = None
+
+
+@dataclass
+class ScoredChunk:
+    chunk: Chunk
+    score: float
+
+
+class _Index:
+    """Minimal inner-product index with a FAISS or NumPy backend."""
+
+    def __init__(self, use_faiss: bool = True):
+        self.use_faiss = bool(use_faiss and faiss is not None)
+        self.vectors: np.ndarray | None = None
+        self._faiss = None
+
+    @property
+    def backend(self) -> str:
+        return "faiss" if self.use_faiss else "numpy"
+
+    def rebuild(self, vectors: np.ndarray | None) -> None:
+        self.vectors = vectors if vectors is not None and len(vectors) else None
+        self._faiss = None
+        if self.vectors is not None and self.use_faiss:
+            self._faiss = faiss.IndexFlatIP(self.vectors.shape[1])
+            self._faiss.add(self.vectors)
+
+    def search(self, q: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+        if self.vectors is None:
+            return np.array([]), np.array([], dtype=int)
+        k = min(k, len(self.vectors))
+        if self._faiss is not None:
+            scores, idx = self._faiss.search(q, k)
+            return scores[0], idx[0]
+        sims = (self.vectors @ q[0]).astype("float32")
+        idx = np.argsort(-sims)[:k]
+        return sims[idx], idx
+
+
+class DocumentStore:
+    def __init__(self, embedder: Embedder, chunk_size: int = 1000, chunk_overlap: int = 150, use_faiss: bool = True):
+        self.embedder = embedder
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.chunks: list[Chunk] = []
+        self._vecs: list[np.ndarray] = []      # one matrix per document, same order as chunks
+        self._doc_names: list[str] = []
+        self._index = _Index(use_faiss)
+
+    # -- introspection -------------------------------------------------
+    @property
+    def backend(self) -> str:
+        return self._index.backend
+
+    @property
+    def documents(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for c in self.chunks:
+            counts[c.filename] = counts.get(c.filename, 0) + 1
+        return counts
+
+    def __len__(self) -> int:
+        return len(self.chunks)
+
+    # -- mutation ------------------------------------------------------
+    def add_document(self, filename: str, pages: list[tuple[int | None, str]]) -> int:
+        """Chunk, embed and index a document. Replaces an existing document of the same name."""
+        if filename in self._doc_names:
+            self.remove_document(filename)
+        new_chunks = chunk_pages(pages, filename, self.chunk_size, self.chunk_overlap)
+        if not new_chunks:
+            return 0
+        vecs = self.embedder.embed([c.text for c in new_chunks])  # may raise EmbeddingError
+        base = len(self.chunks)
+        for i, c in enumerate(new_chunks):
+            c.index = i
+        self.chunks.extend(new_chunks)
+        self._vecs.append(vecs)
+        self._doc_names.append(filename)
+        self._rebuild()
+        log.info("indexed %s: %d chunks (%s)", filename, len(new_chunks), self.backend)
+        return len(self.chunks) - base
+
+    def remove_document(self, filename: str) -> None:
+        if filename not in self._doc_names:
+            return
+        keep_chunks: list[Chunk] = []
+        keep_vecs: list[np.ndarray] = []
+        keep_names: list[str] = []
+        offset = 0
+        for name, mat in zip(self._doc_names, self._vecs):
+            n = len(mat)
+            if name != filename:
+                keep_chunks.extend(self.chunks[offset : offset + n])
+                keep_vecs.append(mat)
+                keep_names.append(name)
+            offset += n
+        self.chunks, self._vecs, self._doc_names = keep_chunks, keep_vecs, keep_names
+        self._rebuild()
+
+    def clear(self) -> None:
+        self.chunks, self._vecs, self._doc_names = [], [], []
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        self._index.rebuild(np.vstack(self._vecs) if self._vecs else None)
+
+    # -- query ---------------------------------------------------------
+    def search(self, query: str, k: int = 4, min_score: float = 0.25) -> list[ScoredChunk]:
+        """Top-k chunks with cosine score >= min_score. Empty list == insufficient evidence."""
+        if not self.chunks or not query.strip():
+            return []
+        q = self.embedder.embed([query])
+        scores, idx = self._index.search(q, k)
+        out: list[ScoredChunk] = []
+        for s, i in zip(scores, idx):
+            if i < 0:
+                continue
+            if float(s) >= min_score:
+                out.append(ScoredChunk(self.chunks[int(i)], float(s)))
+        return out
