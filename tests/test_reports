@@ -1,0 +1,82 @@
+import unittest
+from datetime import datetime, timezone
+
+from core.agent import ResearchAgent
+from core.report_generator import REQUIRED_SECTIONS, build_report, report_filename
+from core.research import Evidence, Plan, ResearchResult
+from tests.fakes import FakeLLM, FakeSearch, make_settings
+
+FIXED = datetime(2026, 10, 9, 12, 0, tzinfo=timezone.utc)
+
+
+def run_agent(**llm_kwargs):
+    agent = ResearchAgent(FakeLLM(**llm_kwargs), make_settings(), search=FakeSearch())
+    return agent.run("Compare RAG and fine-tuning for a university project")
+
+
+class ReportTests(unittest.TestCase):
+    def test_all_required_sections_present_in_order(self):
+        md = build_report(run_agent(), generated_at=FIXED)
+        positions = [md.index(f"## {s}") for s in REQUIRED_SECTIONS]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("2026-10-09 12:00 UTC", md)
+
+    def test_disclaimer_and_no_validation_claim(self):
+        md = build_report(run_agent(), generated_at=FIXED)
+        self.assertIn("not been independently verified", md)
+        self.assertNotIn("scientifically validated.", md.replace("or scientifically validated", ""))
+
+    def test_references_link_real_sources_only(self):
+        res = run_agent()
+        md = build_report(res)
+        for e in res.evidence:
+            self.assertIn(e.url, md)
+        self.assertNotIn("https://made-up", md)
+        self.assertIn("[W1]", md)
+
+    def test_uncited_evidence_is_marked(self):
+        res = run_agent(answer="## Executive Summary\nOnly [W1].\n## Conclusion\nDone [W1].")
+        md = build_report(res)
+        self.assertIn("consulted, not cited", md)
+
+    def test_methodology_reflects_what_actually_ran(self):
+        res = run_agent()
+        md = build_report(res)
+        self.assertIn("nvidia/fake-nemotron", md)
+        self.assertIn(f"Tool calls used: {res.steps_used}", md)
+        self.assertIn("2 web source(s), 0 document passage(s)", md)
+        self.assertIn("What is RAG?", md)
+
+    def test_comparison_table_included_only_when_applicable(self):
+        table = "| A | B |\n|---|---|\n| 1 | 2 |"
+        with_table = build_report(run_agent(answer=f"## Executive Summary\nS [W1].\n## Comparison\n{table}\n## Conclusion\nC."))
+        self.assertIn("### Comparison", with_table)
+        self.assertIn("| A | B |", with_table)
+        self.assertNotIn("### Comparison", build_report(run_agent()))
+
+    def test_model_ignoring_template_still_yields_content(self):
+        md = build_report(run_agent(answer="Just some free text with a claim [W1]."))
+        self.assertIn("Just some free text", md)
+        self.assertIn("## Conclusion", md)
+
+    def test_saved_findings_and_errors_included(self):
+        res = run_agent()
+        res.errors.append("Web search rate limit reached.")
+        md = build_report(res, saved_findings=[{"text": "RAG is cheaper to start"}])
+        self.assertIn("RAG is cheaper to start", md)
+        self.assertIn("rate limit", md)
+
+    def test_no_evidence_report_is_honest(self):
+        res = ResearchResult(question="Q?", answer="No evidence could be gathered.", plan=Plan("Q?", ["Q?"]), model="m")
+        md = build_report(res)
+        self.assertIn("No references: no evidence was collected", md)
+        self.assertIn("_No evidence was collected._", md)
+
+    def test_table_cells_escape_pipes_and_filename_slug(self):
+        res = ResearchResult(question="A/B: what?! ", evidence=[Evidence("W1", "web", "a|b", "t", url="https://x.org")])
+        self.assertIn("a\\|b", build_report(res))
+        self.assertEqual(report_filename(res), "researchpilot-a-b-what.md")
+
+
+if __name__ == "__main__":
+    unittest.main()
