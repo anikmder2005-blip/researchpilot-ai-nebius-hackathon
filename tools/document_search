@@ -1,0 +1,35 @@
+"""Agent-facing wrapper that turns retrieved chunks into Evidence records."""
+from __future__ import annotations
+
+from core.research import Evidence
+from rag.retrieval import DocumentStore
+
+
+class DocumentSearchTool:
+    name = "document_search"
+
+    def __init__(self, store: DocumentStore, top_k: int = 4, min_score: float = 0.25):
+        self.store = store
+        self.top_k = top_k
+        self.min_score = min_score
+
+    @property
+    def available(self) -> bool:
+        return len(self.store) > 0
+
+    def run(self, query: str) -> list[Evidence]:
+        """Return evidence with filename + page. IDs are assigned later by the agent."""
+        hits = self.store.search(query, self.top_k, self.min_score)
+        return [
+            Evidence(
+                id="",
+                kind="doc",
+                title=h.chunk.filename,
+                text=h.chunk.text,
+                source_name=h.chunk.filename,
+                location=h.chunk.location,
+                score=h.score,
+                query=query,
+            )
+            for h in hits
+        ]
