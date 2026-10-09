@@ -1,0 +1,106 @@
+"""Check configuration and (optionally) live connectivity.
+
+    python scripts/verify_setup.py            # configuration only, no network
+    python scripts/verify_setup.py --live     # also calls Nebius/NVIDIA, embeddings and Tavily
+
+Prints PASS / FAIL / SKIP per check. Never prints API keys. Exit code 1 if a required check fails.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import requests  # noqa: E402
+
+from config.settings import load_settings, redact  # noqa: E402
+from core.llm import LLMClient, LLMError  # noqa: E402
+from rag.embeddings import EmbeddingError, NebiusEmbedder  # noqa: E402
+from tools.web_search import SearchError, TavilyProvider  # noqa: E402
+
+failed = False
+
+
+def report(status: str, name: str, detail: str = "") -> None:
+    global failed
+    if status == "FAIL":
+        failed = True
+    print(f"[{status}] {name}" + (f" - {detail}" if detail else ""))
+
+
+def list_models(settings) -> list[str]:
+    resp = requests.get(
+        settings.llm_base_url + "models",
+        headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+        timeout=settings.request_timeout_s,
+    )
+    resp.raise_for_status()
+    return [m.get("id", "") for m in resp.json().get("data", [])]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--live", action="store_true", help="make real API calls (uses a few tokens)")
+    args = ap.parse_args()
+    s = load_settings()
+
+    print(f"Provider: {s.provider_label}\nEndpoint: {s.llm_base_url}\nModel:    {s.llm_model}\n"
+          f"Embedding model: {s.embedding_model}\n")
+
+    for p in s.validate(need_search=True):
+        # The chat-model key is required; embeddings and search are optional features.
+        report("FAIL" if p.startswith(s.key_env_name) or p.startswith("LLM_PROVIDER") else "SKIP", "config", p)
+    if s.llm_ready:
+        report("PASS", "LLM key and model configured")
+    if "nemotron" not in s.llm_model.lower():
+        report("FAIL", "model is an NVIDIA Nemotron model", f"'{s.llm_model}' does not look like a Nemotron model")
+    else:
+        report("PASS", "model name looks like an NVIDIA Nemotron model (not yet confirmed live)")
+
+    if not args.live:
+        print("\nSkipped live checks (run with --live to verify availability).")
+        return 1 if failed else 0
+
+    if s.llm_ready:
+        try:
+            ids = list_models(s)
+            if s.llm_model in ids:
+                report("PASS", "model is listed by the provider", s.llm_model)
+            else:
+                near = [i for i in ids if "nemotron" in i.lower()]
+                report("FAIL", "model is listed by the provider",
+                       f"'{s.llm_model}' not found. Nemotron models available to your key: {near or 'none found'}")
+        except Exception as exc:
+            report("FAIL", "list models", redact(str(exc), s.llm_api_key))
+        try:
+            out = LLMClient(s).chat([{"role": "user", "content": "Reply with the single word: pong"}], max_tokens=1024)
+            report("PASS", "real chat inference", f"got {len(out)} chars")
+        except LLMError as exc:
+            report("FAIL", "real chat inference", str(exc))
+    else:
+        report("SKIP", "live LLM checks", "no API key")
+
+    if s.embeddings_ready:
+        try:
+            v = NebiusEmbedder(s).embed(["hello"])
+            report("PASS", "real embeddings", f"dimension {v.shape[1]}")
+        except EmbeddingError as exc:
+            report("FAIL", "real embeddings", str(exc))
+    else:
+        report("SKIP", "embeddings", "no embedding key")
+
+    if s.search_ready:
+        try:
+            hits = TavilyProvider(s.tavily_api_key).search("NVIDIA Nemotron", 2)
+            report("PASS", "real web search (Tavily)", f"{len(hits)} result(s)")
+        except SearchError as exc:
+            report("FAIL", "real web search (Tavily)", str(exc))
+    else:
+        report("SKIP", "web search", "TAVILY_API_KEY not set")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
