@@ -1,0 +1,36 @@
+"""OPTIONAL live tests against real services. Skipped unless RUN_LIVE_TESTS=1 and keys are configured.
+
+    RUN_LIVE_TESTS=1 python -m pytest tests/test_integration_live.py -v
+"""
+import os
+import unittest
+
+from config.settings import load_settings
+from core.llm import LLMClient
+from rag.embeddings import NebiusEmbedder
+
+LIVE = os.environ.get("RUN_LIVE_TESTS") == "1"
+
+
+@unittest.skipUnless(LIVE, "set RUN_LIVE_TESTS=1 to run live tests")
+class LiveTests(unittest.TestCase):
+    def setUp(self):
+        self.settings = load_settings()
+
+    def test_real_nemotron_inference(self):
+        if not self.settings.llm_ready:
+            self.skipTest("LLM API key not configured")
+        out = LLMClient(self.settings).chat(
+            [{"role": "user", "content": "Reply with the single word: pong"}], max_tokens=1024
+        )
+        self.assertTrue(out.strip())
+
+    def test_real_embeddings(self):
+        if not self.settings.embeddings_ready:
+            self.skipTest("embedding key not configured")
+        vecs = NebiusEmbedder(self.settings).embed(["hello", "world"])
+        self.assertEqual(vecs.shape[0], 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
