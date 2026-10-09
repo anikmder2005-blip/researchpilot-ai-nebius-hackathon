@@ -1,0 +1,17 @@
+# Demo Script (2-3 minutes)
+
+**Before recording:** `.env` filled in, `python scripts/verify_setup.py --live` shows PASS, app running, a project
+created ("RAG vs fine-tuning"), `sample_data/rag_vs_finetuning_notes.md` ready to upload. Do a dry run - live APIs vary.
+
+| Time | Show | Say |
+|---|---|---|
+| 0:00-0:20 | Slide or README header | "Chatbots answer research questions fluently but without evidence. ResearchPilot makes the evidence the product." |
+| 0:20-0:40 | **Documents** page: upload the sample notes, click *Index* | "I add my own notes. They're chunked, embedded with Nebius, and indexed in FAISS - never saved to disk." |
+| 0:40-1:20 | **Research**: paste *"Compare RAG and fine-tuning for a university project and recommend an approach based on cost, complexity, and evaluation requirements."* Watch the live status | "The agent plans sub-questions, searches the web through Tavily, and retrieves passages from my notes. This timeline shows what really ran - no hidden reasoning." |
+| 1:20-1:50 | Read the answer, then open **Evidence** tab; click a web link; point at a `[D1]` document citation with page/chunk | "Every claim cites an evidence ID that maps to a real URL or a filename and page. If the model invents a citation, the app removes it." |
+| 1:50-2:05 | Ask a question the notes can't answer with web search off, or point at the *Limitations* section | "When evidence is missing it says so instead of guessing." |
+| 2:05-2:30 | **Report** page → download → open the Markdown | "One click gives a report with methodology, evidence table, limitations and references - labelled as AI-drafted and unverified." |
+| 2:30-3:00 | Architecture diagram (docs/ARCHITECTURE.md) | "Nemotron on Nebius Token Factory does planning, sufficiency checks and the answer; Nebius embeddings power RAG; a bounded loop keeps it safe. Thank you." |
+
+**Tips:** keep the question fixed; if a live call fails, show the visible error + Retry - it demonstrates the
+no-fabrication behaviour. Never show `.env` on screen.
