@@ -1,0 +1,16 @@
+# Project notes: RAG vs fine-tuning (demo document)
+
+## Retrieval-augmented generation (RAG)
+RAG keeps the language model unchanged and supplies relevant passages at question time. Knowledge can be
+updated by re-indexing documents, no GPU training is needed, and answers can point back to source passages.
+Its quality depends on chunking, the embedding model, and retrieval settings.
+
+## Fine-tuning
+Fine-tuning updates model weights on labelled examples. It can change style, format, or task behaviour, but
+it needs curated training data, compute, and a held-out evaluation set. Facts baked into weights are harder
+to update or attribute to a source.
+
+## Notes for our course project
+- Our budget is small and the deadline is six weeks, so training runs must be avoided or kept tiny.
+- The supervisor wants every claim in the final report traceable to a source.
+- We must describe how we evaluate: retrieval hit rate on a small question set, plus manual grading of answers.
