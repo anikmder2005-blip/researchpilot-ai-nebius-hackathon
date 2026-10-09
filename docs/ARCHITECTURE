@@ -1,0 +1,57 @@
+# Architecture
+
+```mermaid
+flowchart TD
+    U[User] --> UI[Streamlit UI<br/>app.py + ui/]
+
+    subgraph Agent["ResearchAgent (core/agent.py) - bounded loop"]
+        P[Planner<br/>sub-questions] --> G[Gather evidence<br/>max steps / rounds / deadline]
+        G --> R[Sufficiency check<br/>optional follow-up round]
+        R --> G
+        R --> S[Synthesis<br/>cited answer]
+    end
+
+    UI --> P
+    P -. chat .-> LLM
+    R -. chat .-> LLM
+    S -. chat .-> LLM
+    LLM[LLMClient<br/>OpenAI-compatible REST] --> NEB[(Nebius Token Factory<br/>NVIDIA Nemotron)]
+
+    G --> WEB[TavilyProvider<br/>tools/web_search.py]
+    WEB --> TAV[(Tavily API)]
+    G --> DOC[DocumentSearchTool]
+    DOC --> VEC[(FAISS index<br/>in memory)]
+    UP[Upload PDF/TXT/MD] --> ING[Validate → extract → clean → chunk]
+    ING --> EMB[Embedder]
+    EMB --> NEB2[(Nebius embeddings)]
+    EMB --> VEC
+
+    S --> RES[ResearchResult<br/>evidence + answer + timeline]
+    RES --> UI
+    RES --> MEM[(SQLite memory<br/>projects, history, findings)]
+    MEM --> UI
+    RES --> REP[Report generator] --> MD[Markdown download]
+```
+
+## Components
+
+| Module | Responsibility |
+|---|---|
+| `config/settings.py` | Env-based configuration, validation messages, secret redaction |
+| `core/llm.py` | Chat client: retries on 429/5xx, error mapping without secrets, reasoning-block stripping, JSON extraction |
+| `core/planner.py` | Model-written plan with an honest deterministic fallback |
+| `core/agent.py` | Bounded loop, evidence IDs assigned by code, citation validation |
+| `core/research.py` | Evidence / timeline / result types, context fencing, citation helpers |
+| `core/report_generator.py` | Deterministic Markdown report assembly |
+| `tools/web_search.py` | `SearchProvider` interface + Tavily implementation + response parsing |
+| `tools/document_search.py` | Turns retrieved chunks into evidence |
+| `rag/*` | Validation/extraction, chunking, embeddings client, vector store (FAISS / NumPy) |
+| `memory/*` | SQLite schema and repository |
+| `ui/*`, `app.py` | Streamlit workspace |
+
+## Data flow rules
+
+1. Evidence IDs (`W1`, `D2`) are assigned by code, never by the model.
+2. The model may only cite IDs that exist; unknown citations are replaced by a marker and logged in the timeline.
+3. Tool failures are recorded as timeline errors; with zero evidence no model answer is generated.
+4. Retrieved text is wrapped in `<evidence>` blocks and the system prompt tells the model not to follow instructions inside them.
