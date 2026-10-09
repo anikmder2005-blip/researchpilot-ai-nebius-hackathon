@@ -1,0 +1,77 @@
+"""Text cleaning and chunking. Each chunk keeps its filename and page for source attribution."""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+
+@dataclass
+class Chunk:
+    text: str
+    filename: str
+    page: int | None   # 1-based page for PDFs, None for plain text
+    index: int         # chunk number within the document
+
+    @property
+    def location(self) -> str:
+        return f"page {self.page}" if self.page else f"chunk {self.index + 1}"
+
+
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def clean_text(text: str) -> str:
+    """Normalise whitespace, drop control characters, rejoin hyphenated line breaks."""
+    text = _CTRL_RE.sub(" ", text or "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)          # "retriev-\nal" -> "retrieval"
+    text = re.sub(r"[ \t ]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def split_text(text: str, size: int = 1000, overlap: int = 150) -> list[str]:
+    """Split on whitespace boundaries into ~size-character windows with overlap."""
+    if size <= 0:
+        raise ValueError("size must be positive")
+    overlap = max(0, min(overlap, size // 2))
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= size:
+        return [text]
+    pieces: list[str] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(start + size, n)
+        if end < n:
+            # back up to the last whitespace so we don't cut words (but not too far)
+            cut = text.rfind(" ", start + size // 2, end)
+            nl = text.rfind("\n", start + size // 2, end)
+            cut = max(cut, nl)
+            if cut > start:
+                end = cut
+        piece = text[start:end].strip()
+        if piece:
+            pieces.append(piece)
+        if end >= n:
+            break
+        nxt = max(end - overlap, start + 1)
+        # Begin the next chunk on a word boundary so overlap never splits a word.
+        if nxt < end and not text[nxt - 1].isspace():
+            ws = next((i for i in range(nxt, end) if text[i].isspace()), None)
+            nxt = (ws + 1) if ws is not None else end
+        start = nxt
+    return pieces
+
+
+def chunk_pages(
+    pages: list[tuple[int | None, str]], filename: str, size: int = 1000, overlap: int = 150
+) -> list[Chunk]:
+    """Chunk page-by-page so every chunk maps to exactly one page."""
+    chunks: list[Chunk] = []
+    for page_no, raw in pages:
+        for piece in split_text(clean_text(raw), size, overlap):
+            chunks.append(Chunk(text=piece, filename=filename, page=page_no, index=len(chunks)))
+    return chunks
