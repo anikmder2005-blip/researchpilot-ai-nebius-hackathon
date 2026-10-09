@@ -1,0 +1,106 @@
+"""Reusable Streamlit components. All text from the web / documents is rendered as plain markdown
+(never with unsafe_allow_html), so untrusted content cannot inject HTML."""
+from __future__ import annotations
+
+import html
+import re
+
+import streamlit as st
+
+from config.settings import Settings
+from core.research import Evidence, Plan, ResearchResult, TimelineEvent
+
+_MD_SPECIAL = re.compile(r"([\[\]\(\)`*_#|<>])")
+
+
+def md_escape(text: str) -> str:
+    return _MD_SPECIAL.sub(r"\\\1", text or "")
+
+
+def chip(label: str, kind: str = "") -> str:
+    cls = {"ok": "rp-ok", "warn": "rp-warn", "err": "rp-err"}.get(kind, "")
+    return f'<span class="rp-chip {cls}">{html.escape(label)}</span>'
+
+
+def render_setup_problems(settings: Settings) -> bool:
+    """Show a clear setup message. Returns True if the LLM is usable."""
+    if settings.llm_ready:
+        return True
+    st.error(f"**Setup required:** {settings.key_env_name} is not set.")
+    st.markdown(
+        "1. Copy `.env.example` to `.env`\n"
+        f"2. Put your key in `{settings.key_env_name}=...` (Nebius Token Factory: https://tokenfactory.nebius.com)\n"
+        "3. Optionally add `TAVILY_API_KEY` for web research\n"
+        "4. Restart the app\n\n"
+        "ResearchPilot never produces made-up answers when a service is unconfigured."
+    )
+    return False
+
+
+def render_status_chips(settings: Settings, doc_count: int) -> None:
+    chips = [
+        chip(f"Model: {settings.llm_model.split('/')[-1]}", "ok" if settings.llm_ready else "err"),
+        chip("Web search", "ok" if settings.search_ready else "warn"),
+        chip(f"Documents: {doc_count}", "ok" if settings.embeddings_ready else "warn"),
+    ]
+    st.markdown("".join(chips), unsafe_allow_html=True)  # static, escaped by chip()
+
+
+def render_plan(plan: Plan | None) -> None:
+    if not plan:
+        return
+    label = "Research plan" if plan.source == "model" else "Research plan (fallback - model plan unavailable)"
+    with st.expander(label, expanded=False):
+        for i, q in enumerate(plan.subquestions, 1):
+            st.markdown(f"{i}. {md_escape(q)}")
+        tools = [n for n, on in (("Web search", plan.use_web), ("Document retrieval", plan.use_docs)) if on]
+        st.caption(f"Tools: {', '.join(tools) or 'none'}" + (f" - {plan.rationale}" if plan.rationale else ""))
+
+
+def render_timeline(events: list[TimelineEvent]) -> None:
+    if not events:
+        return
+    rows = []
+    for e in events:
+        detail = f" <span class='rp-meta'>- {html.escape(e.detail)}</span>" if e.detail else ""
+        rows.append(
+            f"<div class='rp-step'><span class='rp-dot rp-dot-{html.escape(e.status)}'></span>"
+            f"<span><b>{html.escape(e.name)}</b>{detail}</span></div>"
+        )
+    st.markdown("".join(rows), unsafe_allow_html=True)  # every dynamic value is html.escape()d
+
+
+def render_evidence(evidence: list[Evidence], cited_ids: list[str]) -> None:
+    if not evidence:
+        st.info("No evidence collected for this question.")
+        return
+    cited = set(cited_ids)
+    for e in evidence:
+        status = "cited" if e.id in cited else "consulted"
+        title = md_escape(e.title or e.source_name)
+        with st.container(border=True):
+            if e.kind == "web":
+                st.markdown(f"**[{e.id}]** [{title}]({e.url})")
+                meta = [e.source_name, e.published] if e.published else [e.source_name]
+            else:
+                st.markdown(f"**[{e.id}]** {title}")
+                meta = ["uploaded document", e.location]
+            st.caption(" - ".join(m for m in meta if m) + f" - {status}")
+            st.text(e.text[:600] + ("..." if len(e.text) > 600 else ""))
+
+
+def render_result(result: ResearchResult, key: str) -> None:
+    """Answer + tabs for evidence, activity and plan."""
+    if result.errors:
+        for msg in dict.fromkeys(result.errors):
+            st.warning(msg)
+    if result.answer:
+        st.markdown(result.answer)
+    tab_ev, tab_act = st.tabs([f"Evidence ({len(result.evidence)})", "Agent activity"])
+    with tab_ev:
+        render_evidence(result.evidence, result.cited_ids)
+    with tab_act:
+        render_plan(result.plan)
+        render_timeline(result.timeline)
+        st.caption(f"Model: {result.model} - tool calls: {result.steps_used} - stop: {result.stop_reason or 'n/a'}")
+    st.caption("AI-generated from the sources above. Verify important claims before relying on them.")
