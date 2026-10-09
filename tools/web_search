@@ -1,0 +1,118 @@
+"""Web search behind a small provider interface (Tavily implementation).
+
+Results are returned as plain `SearchHit` records. Titles, URLs and dates come straight from
+the provider; nothing is generated or filled in.
+"""
+from __future__ import annotations
+
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Optional
+from urllib.parse import urlparse
+
+import requests
+
+from config.settings import redact
+
+log = logging.getLogger("researchpilot.search")
+
+TAVILY_URL = "https://api.tavily.com/search"
+
+
+class SearchError(RuntimeError):
+    """Search failed (network, rate limit, bad key, malformed response). Message is user-safe."""
+
+
+@dataclass
+class SearchHit:
+    title: str
+    url: str
+    content: str
+    source_name: str
+    published: str = ""
+    score: float = 0.0
+
+
+class SearchProvider(ABC):
+    name = "search"
+
+    @abstractmethod
+    def search(self, query: str, max_results: int = 5) -> list[SearchHit]:
+        """Return hits or raise SearchError."""
+
+
+def _domain(url: str) -> str:
+    host = urlparse(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def parse_tavily_response(payload: object) -> list[SearchHit]:
+    """Parse a Tavily /search JSON payload. Skips malformed items; raises if the shape is wrong."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        raise SearchError("Search provider returned an unexpected response shape.")
+    hits: list[SearchHit] = []
+    for item in payload["results"]:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            continue  # never keep an entry without a real URL
+        content = str(item.get("raw_content") or item.get("content") or "").strip()
+        if not content:
+            continue
+        try:
+            score = float(item.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        hits.append(
+            SearchHit(
+                title=str(item.get("title") or _domain(url)).strip()[:200],
+                url=url,
+                content=content[:3000],
+                source_name=_domain(url),
+                published=str(item.get("published_date") or "").strip(),
+                score=score,
+            )
+        )
+    return hits
+
+
+class TavilyProvider(SearchProvider):
+    name = "Tavily"
+
+    def __init__(self, api_key: str, timeout_s: int = 30, session: Optional[requests.Session] = None):
+        self.api_key = api_key
+        self.timeout_s = timeout_s
+        self.session = session or requests.Session()
+
+    def search(self, query: str, max_results: int = 5) -> list[SearchHit]:
+        if not self.api_key:
+            raise SearchError("TAVILY_API_KEY is not set; web search is unavailable.")
+        if not query.strip():
+            raise SearchError("Empty search query.")
+        body = {
+            "query": query[:400],
+            "search_depth": "advanced",
+            "max_results": max_results,
+            "include_answer": False,   # we want sources, not Tavily's own summary
+            "include_raw_content": False,
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        try:
+            resp = self.session.post(TAVILY_URL, json=body, headers=headers, timeout=self.timeout_s)
+        except requests.Timeout:
+            raise SearchError(f"Web search timed out after {self.timeout_s}s.")
+        except requests.RequestException as exc:
+            raise SearchError(f"Web search network error: {redact(str(exc), self.api_key)}")
+        if resp.status_code == 429:
+            raise SearchError("Web search rate limit reached. Try again shortly.")
+        if resp.status_code in (401, 403):
+            raise SearchError("Web search rejected the API key (check TAVILY_API_KEY).")
+        if resp.status_code != 200:
+            raise SearchError(f"Web search failed with HTTP {resp.status_code}.")
+        try:
+            payload = resp.json()
+        except ValueError:
+            raise SearchError("Web search returned invalid JSON.")
+        return parse_tavily_response(payload)
