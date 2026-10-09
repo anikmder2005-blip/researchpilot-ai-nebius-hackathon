@@ -1,0 +1,144 @@
+"""Research memory operations: create, inspect, delete, clear."""
+from __future__ import annotations
+
+import json
+import sqlite3
+from typing import Any
+
+MAX_TEXT = 20000
+
+
+def _clip(s: str, n: int = MAX_TEXT) -> str:
+    return (s or "")[:n]
+
+
+class MemoryRepository:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    # ---- projects -----------------------------------------------------
+    def create_project(self, title: str) -> int:
+        title = (title or "").strip()[:200]
+        if not title:
+            raise ValueError("Project title cannot be empty.")
+        cur = self.conn.execute("INSERT INTO projects (title) VALUES (?)", (title,))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT id, title, created_at FROM projects ORDER BY id DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    def get_project(self, project_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT id, title, created_at FROM projects WHERE id = ?", (project_id,)).fetchone()
+        return dict(row) if row else None
+
+    def rename_project(self, project_id: int, title: str) -> None:
+        title = (title or "").strip()[:200]
+        if not title:
+            raise ValueError("Project title cannot be empty.")
+        self.conn.execute("UPDATE projects SET title = ? WHERE id = ?", (title, project_id))
+        self.conn.commit()
+
+    def delete_project(self, project_id: int) -> None:
+        self.conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        self.conn.commit()
+
+    # ---- preferences (only what the user explicitly saves) ------------
+    def set_preference(self, project_id: int, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO preferences (project_id, key, value) VALUES (?, ?, ?) "
+            "ON CONFLICT(project_id, key) DO UPDATE SET value = excluded.value",
+            (project_id, _clip(key, 80), _clip(value, 500)),
+        )
+        self.conn.commit()
+
+    def get_preferences(self, project_id: int) -> dict[str, str]:
+        rows = self.conn.execute("SELECT key, value FROM preferences WHERE project_id = ?", (project_id,)).fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+    def delete_preference(self, project_id: int, key: str) -> None:
+        self.conn.execute("DELETE FROM preferences WHERE project_id = ? AND key = ?", (project_id, key))
+        self.conn.commit()
+
+    # ---- research history ---------------------------------------------
+    def add_question(self, project_id: int, question: str, summary: str, answer: str, sources: list[dict]) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO questions (project_id, question, summary, answer, sources_json) VALUES (?, ?, ?, ?, ?)",
+            (project_id, _clip(question, 2000), _clip(summary, 1500), _clip(answer), json.dumps(_slim_sources(sources))),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def list_questions(self, project_id: int) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT id, question, summary, answer, sources_json, created_at FROM questions "
+            "WHERE project_id = ? ORDER BY id DESC",
+            (project_id,),
+        ).fetchall()
+        return [_with_sources(r) for r in rows]
+
+    def delete_question(self, question_id: int) -> None:
+        self.conn.execute("DELETE FROM questions WHERE id = ?", (question_id,))
+        self.conn.commit()
+
+    # ---- user-selected findings ---------------------------------------
+    def add_finding(self, project_id: int, text: str, sources: list[dict]) -> int:
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("Finding text cannot be empty.")
+        cur = self.conn.execute(
+            "INSERT INTO findings (project_id, text, sources_json) VALUES (?, ?, ?)",
+            (project_id, _clip(text, 3000), json.dumps(_slim_sources(sources))),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def list_findings(self, project_id: int) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT id, text, sources_json, created_at FROM findings WHERE project_id = ? ORDER BY id",
+            (project_id,),
+        ).fetchall()
+        return [_with_sources(r) for r in rows]
+
+    def delete_finding(self, finding_id: int) -> None:
+        self.conn.execute("DELETE FROM findings WHERE id = ?", (finding_id,))
+        self.conn.commit()
+
+    # ---- inspect / clear ----------------------------------------------
+    def export_all(self) -> dict[str, Any]:
+        """Everything stored, for the 'inspect my data' view."""
+        return {
+            "projects": [
+                {
+                    **p,
+                    "preferences": self.get_preferences(p["id"]),
+                    "questions": self.list_questions(p["id"]),
+                    "findings": self.list_findings(p["id"]),
+                }
+                for p in self.list_projects()
+            ]
+        }
+
+    def counts(self) -> dict[str, int]:
+        out = {}
+        for table in ("projects", "preferences", "questions", "findings"):
+            out[table] = int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        return out
+
+    def clear_all(self) -> None:
+        for table in ("findings", "questions", "preferences", "projects"):
+            self.conn.execute(f"DELETE FROM {table}")
+        self.conn.commit()
+
+
+def _slim_sources(sources: list[dict]) -> list[dict]:
+    """Keep only reference fields (no full page text) when persisting sources."""
+    keep = ("id", "kind", "title", "url", "source_name", "published", "location")
+    return [{k: s.get(k, "") for k in keep} for s in (sources or [])][:50]
+
+
+def _with_sources(row: sqlite3.Row) -> dict[str, Any]:
+    d = dict(row)
+    d["sources"] = json.loads(d.pop("sources_json", "[]") or "[]")
+    return d
